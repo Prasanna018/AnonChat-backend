@@ -1,16 +1,28 @@
 from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File
 import cloudinary.uploader
 import asyncio
+from math import radians, sin, cos, sqrt, atan2
 from datetime import datetime, timedelta
 from database import get_db
 from auth import get_current_user, new_uuid
-from models import RoomCreate, RoomResponse, NearbyRoomsResponse
+from models import RoomCreate, RoomJoin, RoomResponse, NearbyRoomsResponse
 from typing import List, Optional
 from routers.websocket import get_live_participant_count
 
 router = APIRouter(prefix="/api/rooms", tags=["rooms"])
 
 MAX_RADIUS = 500  # meters
+
+
+def haversine_meters(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
+    """Return great-circle distance in meters between two WGS-84 coordinates."""
+    R = 6_371_000
+    phi1, phi2 = radians(lat1), radians(lat2)
+    dphi = radians(lat2 - lat1)
+    dlambda = radians(lng2 - lng1)
+    a = sin(dphi / 2) ** 2 + cos(phi1) * cos(phi2) * sin(dlambda / 2) ** 2
+    return R * 2 * atan2(sqrt(a), sqrt(1 - a))
+
 
 ALLOWED_MIME_TYPES = {
     "image/jpeg", "image/png", "image/gif", "image/webp", "image/svg+xml",
@@ -119,7 +131,7 @@ async def create_room(body: RoomCreate, user_id: str = Depends(get_current_user)
 
 
 @router.post("/{room_id}/join")
-async def join_room(room_id: str, user_id: str = Depends(get_current_user)):
+async def join_room(room_id: str, body: RoomJoin, user_id: str = Depends(get_current_user)):
     db = get_db()
     room = await db.rooms.find_one({"_id": room_id})
     if not room:
@@ -127,7 +139,17 @@ async def join_room(room_id: str, user_id: str = Depends(get_current_user)):
     if not room.get("is_active"):
         raise HTTPException(status_code=410, detail="Room is no longer active")
 
-    # Check participant cap (optional: 100 max)
+    # ── Location gate: must be within MAX_RADIUS metres ──────────────────────
+    coords = room["center"]["coordinates"]  # [lng, lat]
+    room_lat, room_lng = coords[1], coords[0]
+    distance = haversine_meters(body.lat, body.lng, room_lat, room_lng)
+    if distance > MAX_RADIUS:
+        raise HTTPException(
+            status_code=403,
+            detail=f"You are {int(distance)}m away from this room. You must be within {MAX_RADIUS}m to join."
+        )
+
+    # Check participant cap
     if room.get("participant_count", 0) >= 100:
         raise HTTPException(status_code=403, detail="Room is full. Try another room or create one.")
 

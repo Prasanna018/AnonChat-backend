@@ -31,6 +31,11 @@ class RoomCreate(BaseModel):
     lng: float
 
 
+class RoomJoin(BaseModel):
+    lat: float
+    lng: float
+
+
 class RoomResponse(BaseModel):
     room_id: str
     center: GeoPoint
