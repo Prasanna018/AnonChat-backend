@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 import asyncio
 from datetime import datetime, timedelta
+import os
 from dotenv import load_dotenv
 import cloudinary
 import cloudinary.uploader
