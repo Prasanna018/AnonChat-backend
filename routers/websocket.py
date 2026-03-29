@@ -42,7 +42,6 @@ async def broadcast(room_id: str, event: dict, exclude: Optional[WebSocket] = No
         if room_id not in room_connections:
             return
 
-        # Snapshot to avoid mutation-during-iteration
         targets: list[tuple[str, WebSocket]] = []
         for user_id, ws_set in room_connections[room_id].items():
             for ws in list(ws_set):
@@ -56,7 +55,6 @@ async def broadcast(room_id: str, event: dict, exclude: Optional[WebSocket] = No
             except Exception:
                 dead.append(ws)
 
-        # Clean up dead sockets after iteration
         for ws in dead:
             _remove_socket_unsafe(room_id, ws)
 
@@ -91,6 +89,28 @@ async def remove_socket_from_room(room_id: str, websocket: WebSocket) -> Optiona
     lock = _ensure_room_lock(room_id)
     async with lock:
         return _remove_socket_unsafe(room_id, websocket)
+
+
+async def destroy_empty_room(room_id: str) -> None:
+    """
+    Permanently delete a room (and all its messages) if no one is connected.
+    Called immediately when the last WebSocket participant disconnects.
+    """
+    # Double-check nobody reconnected in the brief window
+    if get_live_participant_count(room_id) > 0:
+        return
+
+    db = get_db()
+    if db is None:
+        return
+
+    try:
+        await db.messages.delete_many({"room_id": room_id})
+        result = await db.rooms.delete_one({"_id": room_id})
+        if result.deleted_count:
+            print(f"🗑️  Instantly destroyed empty room: {room_id}")
+    except Exception as e:
+        print(f"⚠️  Failed to destroy room {room_id}: {e}")
 
 
 @router.websocket("/api/ws/{room_id}")
@@ -146,7 +166,7 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, token: str = Qu
             exclude=websocket,
         )
 
-    # Send current state to this client
+    # Send current participant count to this client
     try:
         await websocket.send_json({
             "type": "participant_count",
@@ -206,7 +226,7 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, token: str = Qu
                 content = (data.get("content") or "").strip()
                 media_url = data.get("media_url")
                 media_type = data.get("media_type")
-                
+
                 if not content and not media_url:
                     continue
                 if len(content) > 2000:
@@ -256,15 +276,19 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, token: str = Qu
 
         if left_user_id:
             new_participant_count = _get_participant_count(room_id)
-            await broadcast(
-                room_id,
-                {
-                    "type": "user_left",
-                    "user_name": display_name,
-                    "participant_count": new_participant_count,
-                    "timestamp": datetime.utcnow().isoformat(),
-                },
-            )
+
+            # Broadcast departure to remaining participants
+            if new_participant_count > 0:
+                await broadcast(
+                    room_id,
+                    {
+                        "type": "user_left",
+                        "user_name": display_name,
+                        "participant_count": new_participant_count,
+                        "timestamp": datetime.utcnow().isoformat(),
+                    },
+                )
+
             try:
                 await db.rooms.update_one(
                     {"_id": room_id},
@@ -275,3 +299,9 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, token: str = Qu
                 )
             except Exception:
                 pass
+
+            # ── Instant room destruction when the last user leaves ──────────
+            if new_participant_count == 0:
+                # Small grace period (3s) to allow quick reconnects before destroying
+                await asyncio.sleep(3)
+                await destroy_empty_room(room_id)

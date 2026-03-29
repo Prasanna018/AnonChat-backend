@@ -1,5 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File
 import cloudinary.uploader
+import asyncio
 from datetime import datetime, timedelta
 from database import get_db
 from auth import get_current_user, new_uuid
@@ -10,6 +11,15 @@ from routers.websocket import get_live_participant_count
 router = APIRouter(prefix="/api/rooms", tags=["rooms"])
 
 MAX_RADIUS = 500  # meters
+
+ALLOWED_MIME_TYPES = {
+    "image/jpeg", "image/png", "image/gif", "image/webp", "image/svg+xml",
+    "application/pdf", "text/plain",
+    "application/msword",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+}
+
+MAX_FILE_BYTES = 10 * 1024 * 1024  # 10 MB
 
 
 def _room_doc_to_response(doc: dict, distance: Optional[float] = None, live_count: Optional[int] = None) -> RoomResponse:
@@ -54,7 +64,6 @@ async def get_nearby_rooms(
     rooms = []
     async for doc in cursor:
         room_id = doc["_id"]
-        # Use live WebSocket count — 0 means nobody is online right now
         live_count = get_live_participant_count(room_id)
         rooms.append(_room_doc_to_response(doc, doc.get("distance"), live_count=live_count))
     return NearbyRoomsResponse(rooms=rooms)
@@ -206,6 +215,7 @@ async def get_messages(room_id: str, limit: int = 50, user_id: str = Depends(get
         })
     return {"messages": messages}
 
+
 @router.post("/{room_id}/media")
 async def upload_media(
     room_id: str,
@@ -218,46 +228,61 @@ async def upload_media(
         raise HTTPException(status_code=404, detail="Room not found")
     if not room.get("is_active"):
         raise HTTPException(status_code=410, detail="Room is no longer active")
-        
-    # Check if video (reject it)
-    content_type = file.content_type
-    if content_type and content_type.startswith("video/"):
-        raise HTTPException(status_code=400, detail="Video uploads are not allowed.")
-        
-    try:
-        # Read the file contents securely
-        contents = await file.read()
-        
-        # Upload to Cloudinary
-        # We use a generic 'auto' resource type so it handles images and raw documents (like PDF).
-        # We can also be more restrictive and only allow 'image' or 'raw'
-        resource_type = "raw" if content_type and (content_type in ["application/pdf", "text/plain"] or not content_type.startswith("image/")) else "auto"
-        
-        # Configure upload kwargs
-        upload_kwargs = {
-            "resource_type": resource_type,
-            "folder": f"chat_media/{room_id}"
-        }
-        
-        # Apply incoming transformations for images to save storage and bandwidth
-        if resource_type == "auto" and content_type and content_type.startswith("image/"):
-            upload_kwargs["transformation"] = [
-                {"width": 1200, "crop": "limit"},
-                {"quality": "auto", "fetch_format": "auto"}
-            ]
 
-        result = cloudinary.uploader.upload(
+    content_type = (file.content_type or "").lower()
+
+    # Block videos
+    if content_type.startswith("video/"):
+        raise HTTPException(status_code=400, detail="Video uploads are not allowed.")
+
+    # Validate mime type
+    if content_type not in ALLOWED_MIME_TYPES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"File type '{content_type}' is not allowed. Supported: images, PDF, plain text, Word documents."
+        )
+
+    # Read file
+    contents = await file.read()
+
+    # Check actual size
+    if len(contents) > MAX_FILE_BYTES:
+        raise HTTPException(status_code=413, detail="File exceeds maximum allowed size of 10 MB.")
+
+    # Determine Cloudinary resource type
+    if content_type.startswith("image/"):
+        resource_type = "image"
+    else:
+        resource_type = "raw"
+
+    # Build upload kwargs
+    upload_kwargs: dict = {
+        "resource_type": resource_type,
+        "folder": f"echospot/chat_media/{room_id}",
+    }
+
+    # Apply auto quality/format transformation for images
+    if resource_type == "image":
+        upload_kwargs["transformation"] = [
+            {"width": 1200, "crop": "limit"},
+            {"quality": "auto", "fetch_format": "auto"},
+        ]
+
+    # Run Cloudinary upload in thread pool to avoid blocking the event loop
+    try:
+        result = await asyncio.to_thread(
+            cloudinary.uploader.upload,
             contents,
             **upload_kwargs
         )
-        
-        media_url = result.get("secure_url")
-        if not media_url:
-            raise HTTPException(status_code=500, detail="Failed to retrieve URL from Cloudinary")
-            
-        return {
-            "url": media_url,
-            "type": content_type or "application/octet-stream"
-        }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to upload file: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Cloudinary upload failed: {str(e)}")
+
+    media_url = result.get("secure_url")
+    if not media_url:
+        raise HTTPException(status_code=500, detail="Failed to retrieve URL from Cloudinary.")
+
+    return {
+        "url": media_url,
+        "type": content_type or "application/octet-stream",
+    }

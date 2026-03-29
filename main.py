@@ -28,10 +28,10 @@ cloudinary.config(
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await connect_db()
-    # Start background task for room expiration
-    task = asyncio.create_task(expire_rooms_task())
+    # Only keep the expiry task — empty-room destruction is now instant (in websocket.py)
+    task1 = asyncio.create_task(expire_rooms_task())
     yield
-    task.cancel()
+    task1.cancel()
     await close_db()
 
 
