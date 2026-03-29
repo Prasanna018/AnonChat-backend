@@ -4,13 +4,20 @@ from database import get_db
 from auth import get_current_user, new_uuid
 from models import RoomCreate, RoomResponse, NearbyRoomsResponse
 from typing import List, Optional
+from routers.websocket import get_live_participant_count
 
 router = APIRouter(prefix="/api/rooms", tags=["rooms"])
 
 MAX_RADIUS = 500  # meters
 
 
-def _room_doc_to_response(doc: dict, distance: Optional[float] = None) -> RoomResponse:
+def _room_doc_to_response(doc: dict, distance: Optional[float] = None, live_count: Optional[int] = None) -> RoomResponse:
+    """
+    Build a RoomResponse from a MongoDB document.
+    If live_count is provided, it overrides the stored participant_count so the
+    sidebar always reflects the number of users currently connected via WebSocket.
+    """
+    count = live_count if live_count is not None else doc.get("participant_count", 0)
     return RoomResponse(
         room_id=doc["_id"],
         center=doc["center"],
@@ -19,7 +26,7 @@ def _room_doc_to_response(doc: dict, distance: Optional[float] = None) -> RoomRe
         created_at=doc["created_at"],
         last_activity=doc["last_activity"],
         is_active=doc["is_active"],
-        participant_count=doc.get("participant_count", 0),
+        participant_count=count,
         distance=distance,
     )
 
@@ -45,7 +52,10 @@ async def get_nearby_rooms(
     cursor = db.rooms.aggregate(pipeline)
     rooms = []
     async for doc in cursor:
-        rooms.append(_room_doc_to_response(doc, doc.get("distance")))
+        room_id = doc["_id"]
+        # Use live WebSocket count — 0 means nobody is online right now
+        live_count = get_live_participant_count(room_id)
+        rooms.append(_room_doc_to_response(doc, doc.get("distance"), live_count=live_count))
     return NearbyRoomsResponse(rooms=rooms)
 
 

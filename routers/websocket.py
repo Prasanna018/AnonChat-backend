@@ -11,6 +11,15 @@ router = APIRouter(tags=["websocket"])
 # room_id -> { user_id -> set of WebSockets }
 room_connections: Dict[str, Dict[str, Set[WebSocket]]] = {}
 
+# Per-room asyncio lock to serialize broadcast+cleanup and prevent race conditions
+room_locks: Dict[str, asyncio.Lock] = {}
+
+
+def _ensure_room_lock(room_id: str) -> asyncio.Lock:
+    if room_id not in room_locks:
+        room_locks[room_id] = asyncio.Lock()
+    return room_locks[room_id]
+
 
 def _get_participant_count(room_id: str) -> int:
     if room_id not in room_connections:
@@ -18,58 +27,87 @@ def _get_participant_count(room_id: str) -> int:
     return len(room_connections[room_id])
 
 
+def get_live_participant_count(room_id: str) -> int:
+    """Public API: returns the number of unique users currently connected via WebSocket."""
+    return _get_participant_count(room_id)
+
+
 async def broadcast(room_id: str, event: dict, exclude: Optional[WebSocket] = None):
-    """Broadcast event to all connections in a room."""
+    """Broadcast event to all connections in a room. Thread-safe via per-room lock."""
     if room_id not in room_connections:
         return
-    dead_sockets = []
-    
-    for user_ws_set in room_connections[room_id].values():
-        for ws in user_ws_set:
-            if ws == exclude:
-                continue
+
+    lock = _ensure_room_lock(room_id)
+    async with lock:
+        if room_id not in room_connections:
+            return
+
+        # Snapshot to avoid mutation-during-iteration
+        targets: list[tuple[str, WebSocket]] = []
+        for user_id, ws_set in room_connections[room_id].items():
+            for ws in list(ws_set):
+                if ws != exclude:
+                    targets.append((user_id, ws))
+
+        dead: list[WebSocket] = []
+        for _, ws in targets:
             try:
                 await ws.send_json(event)
             except Exception:
-                dead_sockets.append(ws)
-                
-    # Cleanup dead sockets
-    for ws in dead_sockets:
-        _remove_socket_from_room(room_id, ws)
+                dead.append(ws)
+
+        # Clean up dead sockets after iteration
+        for ws in dead:
+            _remove_socket_unsafe(room_id, ws)
 
 
 async def broadcast_all(room_id: str, event: dict):
     await broadcast(room_id, event, exclude=None)
 
 
-def _remove_socket_from_room(room_id: str, websocket: WebSocket) -> Optional[str]:
-    """Removes a socket and returns the user_id if that was their last active socket in the room."""
+def _remove_socket_unsafe(room_id: str, websocket: WebSocket) -> Optional[str]:
+    """
+    Remove a single socket from the room. Assumes caller holds the room lock
+    OR is in a context where concurrent access is not an issue.
+    Returns user_id if that was the user's last socket (they fully left), else None.
+    """
     if room_id not in room_connections:
         return None
-        
+
     for user_id, ws_set in list(room_connections[room_id].items()):
         if websocket in ws_set:
             ws_set.discard(websocket)
             if not ws_set:
-                # User has no more active tabs in this room
                 room_connections[room_id].pop(user_id, None)
                 if not room_connections[room_id]:
                     room_connections.pop(room_id, None)
+                    room_locks.pop(room_id, None)
                 return user_id
     return None
+
+
+async def remove_socket_from_room(room_id: str, websocket: WebSocket) -> Optional[str]:
+    """Thread-safe removal. Returns user_id if user fully left."""
+    lock = _ensure_room_lock(room_id)
+    async with lock:
+        return _remove_socket_unsafe(room_id, websocket)
 
 
 @router.websocket("/api/ws/{room_id}")
 async def websocket_endpoint(websocket: WebSocket, room_id: str, token: str = Query(...)):
     await websocket.accept()
 
-    # Auth
+    # --- Auth ---
     user_id = decode_token(token)
     if not user_id:
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
         return
 
     db = get_db()
+    if db is None:
+        await websocket.close(code=status.WS_1011_INTERNAL_ERROR)
+        return
+
     user = await db.users.find_one({"_id": user_id})
     if not user:
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
@@ -82,18 +120,20 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, token: str = Qu
 
     display_name = user["display_name"]
 
-    # Register connection securely
-    if room_id not in room_connections:
-        room_connections[room_id] = {}
-    if user_id not in room_connections[room_id]:
-        room_connections[room_id][user_id] = set()
-        
-    is_new_user_in_room = len(room_connections[room_id][user_id]) == 0
-    room_connections[room_id][user_id].add(websocket)
+    # --- Register connection ---
+    lock = _ensure_room_lock(room_id)
+    async with lock:
+        if room_id not in room_connections:
+            room_connections[room_id] = {}
+        if user_id not in room_connections[room_id]:
+            room_connections[room_id][user_id] = set()
+
+        is_new_user_in_room = len(room_connections[room_id][user_id]) == 0
+        room_connections[room_id][user_id].add(websocket)
 
     participant_count = _get_participant_count(room_id)
 
-    # If it's a completely new user to the room, notify everyone
+    # Notify others if this is a fresh user (not a second tab)
     if is_new_user_in_room:
         await broadcast(
             room_id,
@@ -106,37 +146,41 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, token: str = Qu
             exclude=websocket,
         )
 
-    # Send state to the connecting client
-    await websocket.send_json({
-        "type": "participant_count",
-        "participant_count": participant_count,
-        "timestamp": datetime.utcnow().isoformat(),
-    })
-
-    # Load history
-    cursor = db.messages.find({"room_id": room_id}).sort("timestamp", 1).limit(50)
-    history = []
-    async for doc in cursor:
-        history.append({
-            "type": "message",
-            "message_id": doc["_id"],
-            "user_id": doc["user_id"],
-            "user_name": doc["display_name"],
-            "content": doc["content"],
-            "timestamp": doc["timestamp"].isoformat(),
-            "is_system": doc.get("is_system", False),
-        })
-    
+    # Send current state to this client
     try:
-        await websocket.send_json({"type": "history", "messages": history})
+        await websocket.send_json({
+            "type": "participant_count",
+            "participant_count": participant_count,
+            "timestamp": datetime.utcnow().isoformat(),
+        })
     except Exception:
-        # Client disconnected immediately
-        _remove_socket_from_room(room_id, websocket)
+        await remove_socket_from_room(room_id, websocket)
         return
 
+    # --- Send message history ---
+    try:
+        cursor = db.messages.find({"room_id": room_id}).sort("timestamp", 1).limit(75)
+        history = []
+        async for doc in cursor:
+            history.append({
+                "type": "message",
+                "message_id": doc["_id"],
+                "user_id": doc["user_id"],
+                "user_name": doc["display_name"],
+                "content": doc["content"],
+                "timestamp": doc["timestamp"].isoformat(),
+                "is_system": doc.get("is_system", False),
+            })
+        await websocket.send_json({"type": "history", "messages": history})
+    except Exception:
+        await remove_socket_from_room(room_id, websocket)
+        return
+
+    # --- Message receive loop ---
     try:
         while True:
             raw = await websocket.receive_text()
+
             try:
                 data = json.loads(raw)
             except json.JSONDecodeError:
@@ -144,6 +188,18 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, token: str = Qu
 
             msg_type = data.get("type")
 
+            # --- Ping / Pong keepalive ---
+            if msg_type == "ping":
+                try:
+                    await websocket.send_json({
+                        "type": "pong",
+                        "timestamp": datetime.utcnow().isoformat(),
+                    })
+                except Exception:
+                    break
+                continue
+
+            # --- Send a chat message ---
             if msg_type == "send_message":
                 content = (data.get("content") or "").strip()
                 if not content or len(content) > 2000:
@@ -159,8 +215,15 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, token: str = Qu
                     "timestamp": now,
                     "is_system": False,
                 }
-                await db.messages.insert_one(msg_doc)
-                await db.rooms.update_one({"_id": room_id}, {"$set": {"last_activity": now}})
+
+                try:
+                    await db.messages.insert_one(msg_doc)
+                    await db.rooms.update_one(
+                        {"_id": room_id},
+                        {"$set": {"last_activity": now}},
+                    )
+                except Exception:
+                    continue
 
                 event = {
                     "type": "message",
@@ -175,10 +238,11 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, token: str = Qu
 
     except (WebSocketDisconnect, RuntimeError):
         pass
+    except Exception:
+        pass
     finally:
-        # Properly clean up socket, checking if user completely left the room
-        left_user_id = _remove_socket_from_room(room_id, websocket)
-        
+        left_user_id = await remove_socket_from_room(room_id, websocket)
+
         if left_user_id:
             new_participant_count = _get_participant_count(room_id)
             await broadcast(
@@ -190,11 +254,13 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, token: str = Qu
                     "timestamp": datetime.utcnow().isoformat(),
                 },
             )
-            # Update DB sync with actual live WebSocket logic
-            await db.rooms.update_one(
-                {"_id": room_id},
-                {
-                    "$pull": {"participants": user_id}, 
-                    "$set": {"participant_count": new_participant_count}
-                }
-            )
+            try:
+                await db.rooms.update_one(
+                    {"_id": room_id},
+                    {
+                        "$pull": {"participants": user_id},
+                        "$set": {"participant_count": new_participant_count},
+                    },
+                )
+            except Exception:
+                pass
