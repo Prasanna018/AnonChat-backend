@@ -167,7 +167,9 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, token: str = Qu
                 "message_id": doc["_id"],
                 "user_id": doc["user_id"],
                 "user_name": doc["display_name"],
-                "content": doc["content"],
+                "content": doc.get("content"),
+                "media_url": doc.get("media_url"),
+                "media_type": doc.get("media_type"),
                 "timestamp": doc["timestamp"].isoformat(),
                 "is_system": doc.get("is_system", False),
             })
@@ -202,7 +204,12 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, token: str = Qu
             # --- Send a chat message ---
             if msg_type == "send_message":
                 content = (data.get("content") or "").strip()
-                if not content or len(content) > 2000:
+                media_url = data.get("media_url")
+                media_type = data.get("media_type")
+                
+                if not content and not media_url:
+                    continue
+                if len(content) > 2000:
                     continue
 
                 now = datetime.utcnow()
@@ -211,7 +218,9 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, token: str = Qu
                     "room_id": room_id,
                     "user_id": user_id,
                     "display_name": display_name,
-                    "content": content,
+                    "content": content if content else None,
+                    "media_url": media_url,
+                    "media_type": media_type,
                     "timestamp": now,
                     "is_system": False,
                 }
@@ -230,7 +239,9 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, token: str = Qu
                     "message_id": msg_doc["_id"],
                     "user_id": user_id,
                     "user_name": display_name,
-                    "content": content,
+                    "content": content if content else None,
+                    "media_url": media_url,
+                    "media_type": media_type,
                     "timestamp": now.isoformat(),
                     "is_system": False,
                 }

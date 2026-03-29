@@ -1,4 +1,5 @@
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File
+import cloudinary.uploader
 from datetime import datetime, timedelta
 from database import get_db
 from auth import get_current_user, new_uuid
@@ -197,8 +198,66 @@ async def get_messages(room_id: str, limit: int = 50, user_id: str = Depends(get
             "room_id": doc["room_id"],
             "user_id": doc["user_id"],
             "display_name": doc["display_name"],
-            "content": doc["content"],
+            "content": doc.get("content"),
+            "media_url": doc.get("media_url"),
+            "media_type": doc.get("media_type"),
             "timestamp": doc["timestamp"].isoformat(),
             "is_system": doc.get("is_system", False),
         })
     return {"messages": messages}
+
+@router.post("/{room_id}/media")
+async def upload_media(
+    room_id: str,
+    file: UploadFile = File(...),
+    user_id: str = Depends(get_current_user)
+):
+    db = get_db()
+    room = await db.rooms.find_one({"_id": room_id})
+    if not room:
+        raise HTTPException(status_code=404, detail="Room not found")
+    if not room.get("is_active"):
+        raise HTTPException(status_code=410, detail="Room is no longer active")
+        
+    # Check if video (reject it)
+    content_type = file.content_type
+    if content_type and content_type.startswith("video/"):
+        raise HTTPException(status_code=400, detail="Video uploads are not allowed.")
+        
+    try:
+        # Read the file contents securely
+        contents = await file.read()
+        
+        # Upload to Cloudinary
+        # We use a generic 'auto' resource type so it handles images and raw documents (like PDF).
+        # We can also be more restrictive and only allow 'image' or 'raw'
+        resource_type = "raw" if content_type and (content_type in ["application/pdf", "text/plain"] or not content_type.startswith("image/")) else "auto"
+        
+        # Configure upload kwargs
+        upload_kwargs = {
+            "resource_type": resource_type,
+            "folder": f"chat_media/{room_id}"
+        }
+        
+        # Apply incoming transformations for images to save storage and bandwidth
+        if resource_type == "auto" and content_type and content_type.startswith("image/"):
+            upload_kwargs["transformation"] = [
+                {"width": 1200, "crop": "limit"},
+                {"quality": "auto", "fetch_format": "auto"}
+            ]
+
+        result = cloudinary.uploader.upload(
+            contents,
+            **upload_kwargs
+        )
+        
+        media_url = result.get("secure_url")
+        if not media_url:
+            raise HTTPException(status_code=500, detail="Failed to retrieve URL from Cloudinary")
+            
+        return {
+            "url": media_url,
+            "type": content_type or "application/octet-stream"
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to upload file: {str(e)}")

@@ -49,7 +49,9 @@ class NearbyRoomsResponse(BaseModel):
 
 # ----- Message -----
 class MessageCreate(BaseModel):
-    content: str
+    content: Optional[str] = None
+    media_url: Optional[str] = None
+    media_type: Optional[str] = None
 
 
 class MessageResponse(BaseModel):
@@ -57,7 +59,9 @@ class MessageResponse(BaseModel):
     room_id: str
     user_id: str
     display_name: str
-    content: str
+    content: Optional[str] = None
+    media_url: Optional[str] = None
+    media_type: Optional[str] = None
     timestamp: datetime
     is_system: bool = False
 
@@ -66,13 +70,19 @@ class MessageResponse(BaseModel):
 class WSMessage(BaseModel):
     type: str  # "send_message" | "typing"
     content: Optional[str] = None
+    media_url: Optional[str] = None
+    media_type: Optional[str] = None
     is_typing: Optional[bool] = None
 
 
 class WSEvent(BaseModel):
-    type: str  # "message" | "user_joined" | "user_left" | "room_closed" | "typing"
+    type: str  # "message" | "history" | "user_joined" | "user_left" | "room_closed" | "typing"
+    message_id: Optional[str] = None
+    user_id: Optional[str] = None
     user_name: Optional[str] = None
     content: Optional[str] = None
+    media_url: Optional[str] = None
+    media_type: Optional[str] = None
     timestamp: Optional[str] = None
     reason: Optional[str] = None
     is_typing: Optional[bool] = None
