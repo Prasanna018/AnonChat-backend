@@ -5,6 +5,7 @@ from typing import Dict, Set, Optional
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Query, status
 from database import get_db
 from auth import decode_token, new_uuid
+from utils import haversine_meters, MAX_RADIUS
 
 router = APIRouter(tags=["websocket"])
 
@@ -113,6 +114,31 @@ async def destroy_empty_room(room_id: str) -> None:
         print(f"⚠️  Failed to destroy room {room_id}: {e}")
 
 
+async def force_destroy_room_and_broadcast(room_id: str, reason: str):
+    """Broadcasts termination, deletes room, and drops connections."""
+    await broadcast_all(room_id, {"type": "room_closed", "reason": reason})
+
+    db = get_db()
+    if db:
+        try:
+            await db.messages.delete_many({"room_id": room_id})
+            await db.rooms.delete_one({"_id": room_id})
+        except Exception:
+            pass
+
+    lock = _ensure_room_lock(room_id)
+    async with lock:
+        if room_id in room_connections:
+            for uid, ws_set in list(room_connections[room_id].items()):
+                for ws in list(ws_set):
+                    try:
+                        await ws.close()
+                    except:
+                        pass
+            room_connections.pop(room_id, None)
+            room_locks.pop(room_id, None)
+
+
 @router.websocket("/api/ws/{room_id}")
 async def websocket_endpoint(websocket: WebSocket, room_id: str, token: str = Query(...)):
     await websocket.accept()
@@ -210,6 +236,31 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, token: str = Qu
 
             msg_type = data.get("type")
 
+            # --- Location Enforcement ---
+            lat = data.get("lat")
+            lng = data.get("lng")
+            if lat is not None and lng is not None:
+                room_lat = room["center"]["coordinates"][1]
+                room_lng = room["center"]["coordinates"][0]
+                distance = haversine_meters(lat, lng, room_lat, room_lng)
+                
+                if distance > MAX_RADIUS:
+                    if user_id == room.get("created_by"):
+                        await force_destroy_room_and_broadcast(
+                            room_id, 
+                            "Creator moved out of 500m radius. The room is now destroyed."
+                        )
+                        break
+                    else:
+                        try:
+                            await websocket.send_json({
+                                "type": "room_closed", 
+                                "reason": "You have left the 500m room boundary."
+                            })
+                        except:
+                            pass
+                        break
+
             # --- Ping / Pong keepalive ---
             if msg_type == "ping":
                 try:
@@ -302,6 +353,4 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, token: str = Qu
 
             # ── Instant room destruction when the last user leaves ──────────
             if new_participant_count == 0:
-                # Small grace period (3s) to allow quick reconnects before destroying
-                await asyncio.sleep(3)
-                await destroy_empty_room(room_id)
+                asyncio.create_task(destroy_empty_room(room_id))

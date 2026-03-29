@@ -1,8 +1,8 @@
 from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File
 import cloudinary.uploader
 import asyncio
-from math import radians, sin, cos, sqrt, atan2
 from datetime import datetime, timedelta
+from utils import MAX_RADIUS, haversine_meters
 from database import get_db
 from auth import get_current_user, new_uuid
 from models import RoomCreate, RoomJoin, RoomResponse, NearbyRoomsResponse
@@ -10,18 +10,6 @@ from typing import List, Optional
 from routers.websocket import get_live_participant_count
 
 router = APIRouter(prefix="/api/rooms", tags=["rooms"])
-
-MAX_RADIUS = 500  # meters
-
-
-def haversine_meters(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
-    """Return great-circle distance in meters between two WGS-84 coordinates."""
-    R = 6_371_000
-    phi1, phi2 = radians(lat1), radians(lat2)
-    dphi = radians(lat2 - lat1)
-    dlambda = radians(lng2 - lng1)
-    a = sin(dphi / 2) ** 2 + cos(phi1) * cos(phi2) * sin(dlambda / 2) ** 2
-    return R * 2 * atan2(sqrt(a), sqrt(1 - a))
 
 
 ALLOWED_MIME_TYPES = {
